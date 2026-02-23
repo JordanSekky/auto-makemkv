@@ -31,6 +31,10 @@ struct Args {
     )]
     output_dir: PathBuf,
 
+    /// MakeMKV settings directory (optional if running on a machine with makemkv already configured)
+    #[arg(short, long, env = "AUTO_MAKEMKV_SETTINGS_DIR")]
+    settings_dir: Option<PathBuf>,
+
     /// MakeMKV API key (optional if running on a machine with makemkv already configured)
     #[arg(short, long, env = "MAKEMKV_KEY")]
     makemkv_key: Option<String>,
@@ -71,7 +75,10 @@ async fn main() -> Result<()> {
     info!("Output directory: {:?}", args.output_dir);
 
     // Core shared components
-    let makemkv = Arc::new(MakeMKV::new(args.makemkv_key.as_deref(), &args.output_dir));
+    let makemkv = Arc::new(MakeMKV::new(
+        args.makemkv_key.as_deref(),
+        args.settings_dir.as_ref(),
+    ));
     makemkv.init().context("Failed to initialize MakeMKV")?;
     // Use RwLock to manage concurrency between rips and reconfiguration
     let state = Arc::new(RwLock::new(()));

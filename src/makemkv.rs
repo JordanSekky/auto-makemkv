@@ -101,14 +101,14 @@ pub struct Title {
 
 pub struct MakeMKV {
     key: Option<String>,
-    output_dir: PathBuf,
+    settings_dir: Option<PathBuf>,
 }
 
 impl MakeMKV {
-    pub fn new(key: Option<&str>, output_dir: &PathBuf) -> Self {
+    pub fn new(key: Option<&str>, settings_dir: Option<&PathBuf>) -> Self {
         Self {
             key: key.map(|k| k.to_string()),
-            output_dir: output_dir.clone(),
+            settings_dir: settings_dir.map(|s| s.clone()),
         }
     }
 
@@ -119,10 +119,10 @@ impl MakeMKV {
         use std::fs;
         use std::io::Write;
 
-        let config_path = self.output_dir.join("settings.conf");
+        let config_path = self.settings_dir.as_ref().map(|s| s.join("settings.conf"));
 
-        if !config_path.exists() && self.key.is_some() {
-            let mut file = fs::File::create(&config_path)?;
+        if config_path.is_some() && !config_path.clone().unwrap().exists() && self.key.is_some() {
+            let mut file = fs::File::create(config_path.as_ref().unwrap())?;
             let conf = r#"
 app_Key = "<KEY_PLACEHOLDER>"
 app_ShowDebug = "1"
@@ -137,11 +137,11 @@ io_RBufSizeMB = "1024"
         Ok(())
     }
 
-    // Use output directory if key is provided, otherwise use home directory.
+    // Use settings directory if provided, otherwise use home directory.
     // This way if users are running this locally, they can use their default MakeMKV settings.
     fn home(&self) -> PathBuf {
-        if let Some(_) = &self.key {
-            self.output_dir.clone()
+        if self.settings_dir.is_some() {
+            self.settings_dir.clone().unwrap()
         } else {
             PathBuf::from(std::env::var("HOME").unwrap())
         }
