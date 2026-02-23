@@ -105,7 +105,3 @@ Logging is controlled via the `RUST_LOG` environment variable (defaults to `info
 ```bash
 RUST_LOG=debug auto-makemkv
 ```
-
-## License
-
-See [MakeMKV EULA](https://www.makemkv.com/eula/) for MakeMKV licensing terms.
