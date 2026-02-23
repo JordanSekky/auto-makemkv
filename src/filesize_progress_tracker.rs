@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, path::PathBuf};
+use std::{fmt::Display, path::PathBuf};
 
 use indicatif::style::ProgressTracker;
 
@@ -6,7 +6,8 @@ use indicatif::style::ProgressTracker;
 pub struct FilesizeProgressTracker {
     output_dir: PathBuf,
     cur_file: Option<PathBuf>,
-    length: u64,
+    length_bytes: u64,
+    estimated_total_bytes: Option<f64>,
 }
 
 impl FilesizeProgressTracker {
@@ -14,8 +15,31 @@ impl FilesizeProgressTracker {
         Self {
             output_dir,
             cur_file: None,
-            length: 0,
+            length_bytes: 0,
+            estimated_total_bytes: None,
         }
+    }
+
+    pub fn current_file(&self) -> Option<PathBuf> {
+        self.cur_file.clone()
+    }
+
+    pub fn update(&mut self, pos: u64, len: Option<u64>) {
+        self.cur_file = self.find_latest_file();
+        if let Some(path) = &self.cur_file {
+            self.length_bytes = std::fs::metadata(path).unwrap().len();
+            self.estimated_total_bytes =
+                len.map(|l| l as f64 * self.length_bytes as f64 / pos as f64);
+        } else {
+            self.length_bytes = 0;
+            self.estimated_total_bytes = None;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.cur_file = None;
+        self.length_bytes = 0;
+        self.estimated_total_bytes = None;
     }
 
     fn find_latest_file(&mut self) -> Option<PathBuf> {
@@ -47,35 +71,13 @@ impl FilesizeProgressTracker {
     }
 }
 
-impl ProgressTracker for FilesizeProgressTracker {
-    fn clone_box(&self) -> Box<dyn ProgressTracker> {
-        Box::new(self.clone())
-    }
-
-    fn tick(&mut self, _state: &indicatif::ProgressState, _now: std::time::Instant) {
-        self.cur_file = self.find_latest_file();
-        if let Some(path) = &self.cur_file {
-            self.length = std::fs::metadata(path).unwrap().len();
-        } else {
-            self.length = 0;
-        }
-    }
-
-    fn reset(&mut self, _state: &indicatif::ProgressState, _now: std::time::Instant) {
-        self.length = 0;
-        self.cur_file = None;
-    }
-
-    fn write(&self, state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write) {
+impl Display for FilesizeProgressTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
-        let size = self.length as f64;
+
+        let mut display_size = self.length_bytes as f64;
+        let mut display_total = self.estimated_total_bytes.unwrap_or(display_size);
         let mut unit = units[0];
-        let total_factor = state
-            .len()
-            .map(|l| l as f64 / state.pos() as f64)
-            .unwrap_or(1.0);
-        let mut display_size = size;
-        let mut display_total = size * total_factor;
 
         for u in &units {
             unit = u;
@@ -85,23 +87,40 @@ impl ProgressTracker for FilesizeProgressTracker {
             display_size /= 1024.0;
             display_total /= 1024.0;
         }
-        match &self.cur_file {
-            Some(path) => {
-                // We know current file and can estimate total
-                write!(
-                    w,
-                    "{}: {:.2} {} / ~{:.2} {}",
-                    path.file_name()
-                        .unwrap_or(OsStr::new("Unknown"))
-                        .to_string_lossy(),
-                    display_size,
-                    unit,
-                    display_total,
-                    unit
-                )
-                .unwrap();
-            }
-            None => (),
+
+        if let Some(path) = &self.cur_file {
+            write!(
+                f,
+                "{}: {:.2} {} / ~{:.2} {}",
+                path.file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("Unknown"))
+                    .to_string_lossy(),
+                display_size,
+                unit,
+                display_total,
+                unit
+            )
+        } else {
+            Ok(())
         }
+    }
+}
+
+impl ProgressTracker for FilesizeProgressTracker {
+    fn clone_box(&self) -> Box<dyn ProgressTracker> {
+        Box::new(self.clone())
+    }
+
+    fn tick(&mut self, state: &indicatif::ProgressState, _now: std::time::Instant) {
+        self.update(state.pos(), state.len());
+    }
+
+    fn reset(&mut self, _state: &indicatif::ProgressState, _now: std::time::Instant) {
+        self.clear();
+    }
+
+    fn write(&self, _state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write) {
+        // Just delegate to Display implementation
+        let _ = write!(w, "{self}");
     }
 }

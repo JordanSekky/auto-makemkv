@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::MultiProgress;
 use log::{debug, error, info, warn};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ mod output;
 use makemkv::{Drive, MakeMKV};
 use output::init_logger;
 
-use crate::output::{create_current_progress_bar, create_total_progress_bar};
+use crate::output::RipProgressTracker;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -37,6 +38,10 @@ struct Args {
     /// Polling interval in seconds
     #[arg(long, env = "AUTO_MAKEMKV_POLL_INTERVAL", default_value = "5")]
     poll_interval: u64,
+
+    /// Whether to run with pretty progress bars (default: true if stdout is a terminal)
+    #[arg(long, short, action = clap::ArgAction::Set, default_value = if std::io::stdout().is_terminal() { "true" } else { "false" })]
+    interactive: bool,
 }
 
 // Shared state removed, using RwLock<()> for synchronization
@@ -45,11 +50,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize MultiProgress and Logger
-    let multi_progress = MultiProgress::new();
-    init_logger(multi_progress.clone())?;
-
     let args = Args::parse();
+    // Initialize MultiProgress and Logger
+    let multi_progress = if args.interactive {
+        Some(MultiProgress::new())
+    } else {
+        None
+    };
+    init_logger(multi_progress.clone())?;
 
     if !args.output_dir.exists() {
         std::fs::create_dir_all(&args.output_dir).context("Failed to create output directory")?;
@@ -75,7 +83,7 @@ async fn main() -> Result<()> {
     // Run initial discovery
     discover_and_spawn(
         &makemkv,
-        &multi_progress,
+        multi_progress.as_ref(),
         &state,
         &args,
         &mut tasks,
@@ -87,7 +95,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1. Attempting reconfiguration...");
-                handle_sigusr1(&makemkv, &multi_progress, &state, &args, &mut tasks, shutdown_tx.clone()).await?;
+                handle_sigusr1(&makemkv, multi_progress.as_ref(), &state, &args, &mut tasks, shutdown_tx.clone()).await?;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C. Shutting down...");
@@ -110,7 +118,7 @@ async fn main() -> Result<()> {
 
 async fn discover_and_spawn(
     makemkv: &Arc<MakeMKV>,
-    multi_progress: &MultiProgress,
+    multi_progress: Option<&MultiProgress>,
     state: &Arc<RwLock<()>>,
     args: &Args,
     tasks: &mut Vec<JoinHandle<()>>,
@@ -127,7 +135,7 @@ async fn discover_and_spawn(
 
     for drive in drives {
         let makemkv = makemkv.clone();
-        let multi_progress = multi_progress.clone();
+        let multi_progress = multi_progress.cloned();
         let state = state.clone();
         let args = args.clone();
         let shutdown_rx = shutdown_tx.subscribe();
@@ -143,7 +151,7 @@ async fn discover_and_spawn(
 
 async fn handle_sigusr1(
     makemkv: &Arc<MakeMKV>,
-    multi_progress: &MultiProgress,
+    multi_progress: Option<&MultiProgress>,
     state: &Arc<RwLock<()>>,
     args: &Args,
     tasks: &mut Vec<JoinHandle<()>>,
@@ -181,7 +189,7 @@ async fn handle_sigusr1(
 async fn drive_task_loop(
     drive: Drive,
     makemkv: Arc<MakeMKV>,
-    multi_progress: MultiProgress,
+    multi_progress: Option<MultiProgress>,
     state: Arc<RwLock<()>>,
     args: Args,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -250,7 +258,7 @@ async fn drive_task_loop(
                                 // Permit dropped at end of scope or break
                                 break;
                             }
-                            res = run_rip_workflow(&makemkv, &multi_progress, drive_index, &base_name, &args.output_dir, args.min_length) => res
+                            res = run_rip_workflow(&makemkv, multi_progress.as_ref(), drive_index, &base_name, &args.output_dir, args.min_length) => res
                         };
 
                         // Release "Rip Permit"
@@ -314,7 +322,7 @@ async fn drive_task_loop(
 
 async fn run_rip_workflow(
     makemkv: &MakeMKV,
-    multi_progress: &MultiProgress,
+    multi_progress: Option<&MultiProgress>,
     drive_index: usize,
     base_name: &str,
     output_root: &PathBuf,
@@ -329,22 +337,11 @@ async fn run_rip_workflow(
         drive_index, base_name, final_output_dir
     );
 
-    // Create progress bar
-    let current_bar = create_current_progress_bar(
-        multi_progress,
-        100,
-        &format!("Drive {}: Ripping {}...", drive_index, base_name),
-        &final_output_dir,
-    );
-    let total_bar = create_total_progress_bar(
-        multi_progress,
-        100,
-        &format!("Drive {}: Ripping {}...", drive_index, base_name),
-        &current_bar,
-    );
+    // Create progress tracker
+    let tracker =
+        RipProgressTracker::new(multi_progress, drive_index, base_name, &final_output_dir);
+    let tracker_clone = tracker.clone();
 
-    let total_bar_clone = total_bar.clone();
-    let current_bar_clone = current_bar.clone();
     makemkv
         .rip_disc(
             drive_index,
@@ -352,39 +349,19 @@ async fn run_rip_workflow(
             min_length,
             move |update| match update {
                 makemkv::ProgressUpdate::Progress(p) => {
-                    total_bar_clone.set_length(p.max);
-                    current_bar_clone.set_length(p.max);
-                    total_bar_clone.set_position(p.total);
-                    current_bar_clone.set_position(p.current);
+                    tracker_clone.update_progress(&p);
                 }
                 makemkv::ProgressUpdate::Message(msg) => {
                     debug!("Drive {}: MakeMKV: {}", drive_index, msg);
                 }
                 makemkv::ProgressUpdate::ProgressTitle(progress_title) => {
-                    match progress_title.title_type {
-                        makemkv::ProgressTitleType::Current => {
-                            current_bar_clone.set_message(format!(
-                                "Drive {}: Title {}: {}",
-                                drive_index, progress_title.id, progress_title.name
-                            ));
-                        }
-                        makemkv::ProgressTitleType::Total => {
-                            total_bar_clone.set_message(format!(
-                                "Drive {}: Title {}: {}",
-                                drive_index, progress_title.id, progress_title.name
-                            ));
-                        }
-                    }
+                    tracker_clone.update_title(&progress_title);
                 }
             },
         )
         .await?;
 
-    current_bar.finish_and_clear();
-    total_bar.finish_with_message(format!(
-        "Drive {}: Finished ripping {}",
-        drive_index, base_name
-    ));
+    tracker.finish();
     Ok(())
 }
 

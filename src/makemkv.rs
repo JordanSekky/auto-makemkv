@@ -324,7 +324,7 @@ pub enum ProgressTitleType {
 pub struct ProgressTitle {
     pub title_type: ProgressTitleType,
     pub _code: u64,
-    pub id: u64,
+    pub _id: u64,
     pub name: String,
 }
 
@@ -487,7 +487,7 @@ fn parse_prgc_prgt_line(line: &str) -> Option<ProgressTitle> {
             ProgressTitleType::Total
         },
         _code: parts[0].parse().unwrap_or(0),
-        id: parts[1].parse().unwrap_or(0),
+        _id: parts[1].parse().unwrap_or(0),
         name: parts[2].to_string(),
     })
 }
