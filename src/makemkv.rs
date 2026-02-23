@@ -100,12 +100,51 @@ pub struct Title {
 }
 
 pub struct MakeMKV {
-    // potentially configuration here
+    key: Option<String>,
+    output_dir: PathBuf,
 }
 
 impl MakeMKV {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(key: Option<&str>, output_dir: &PathBuf) -> Self {
+        Self {
+            key: key.map(|k| k.to_string()),
+            output_dir: output_dir.clone(),
+        }
+    }
+
+    pub fn init(&self) -> Result<()> {
+        // Create the configuration file if it doesn't exist
+        // Path: <output_dir>/settings.conf
+
+        use std::fs;
+        use std::io::Write;
+
+        let config_path = self.output_dir.join("settings.conf");
+
+        if !config_path.exists() && self.key.is_some() {
+            let mut file = fs::File::create(&config_path)?;
+            let conf = r#"
+app_Key = "<KEY_PLACEHOLDER>"
+app_ShowDebug = "1"
+io_ErrorRetryCount = "10"
+io_RBufSizeMB = "1024"
+"#
+            .replace("<KEY_PLACEHOLDER>", &self.key.as_ref().unwrap());
+
+            file.write_all(conf.trim_start().as_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    // Use output directory if key is provided, otherwise use home directory.
+    // This way if users are running this locally, they can use their default MakeMKV settings.
+    fn home(&self) -> PathBuf {
+        if let Some(_) = &self.key {
+            self.output_dir.clone()
+        } else {
+            PathBuf::from(std::env::var("HOME").unwrap())
+        }
     }
 
     pub async fn discover_drives(&self) -> Result<Vec<Drive>> {
@@ -116,6 +155,7 @@ impl MakeMKV {
             .arg("--cache=1")
             .arg("info")
             .arg("disc:9999")
+            .env("HOME", self.home())
             .kill_on_drop(true)
             .output()
             .await
@@ -147,6 +187,7 @@ impl MakeMKV {
             .arg("--noscan")
             .arg("info")
             .arg(format!("disc:{}", drive_index))
+            .env("HOME", self.home())
             .kill_on_drop(true)
             .output()
             .await
@@ -203,6 +244,7 @@ impl MakeMKV {
             .arg(format!("disc:{}", drive_index))
             .arg("all")
             .arg(output_dir)
+            .env("HOME", self.home())
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
