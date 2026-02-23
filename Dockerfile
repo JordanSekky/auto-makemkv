@@ -1,4 +1,4 @@
-FROM rust:trixie AS chef
+FROM rust:bookworm AS chef
 RUN cargo install cargo-chef
 WORKDIR /app
 
