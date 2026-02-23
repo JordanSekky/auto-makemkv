@@ -185,18 +185,20 @@ impl MakeMKV {
         &self,
         drive_index: usize,
         output_dir: &PathBuf,
+        min_length: u64,
         progress_callback: F,
     ) -> Result<()>
     where
         F: Fn(ProgressUpdate) + Send + Sync + 'static,
     {
-        // mkv disc:N all <destination_folder> --noscan -r --progress=-same
+        // mkv disc:N all <destination_folder> --noscan -r --progress=-same --minlength=seconds
         // Assuming 'all' for now as per plan
         let mut child = Command::new("makemkvcon")
             .arg("-r")
             .arg("--cache=1024")
             .arg("--noscan")
             .arg("--progress=-same")
+            .arg(format!("--minlength={}", min_length))
             .arg("mkv")
             .arg(format!("disc:{}", drive_index))
             .arg("all")

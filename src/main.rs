@@ -60,11 +60,8 @@ async fn main() -> Result<()> {
 
     // Core shared components
     let makemkv = Arc::new(MakeMKV::new());
-    // output removed, using multi_progress passed directly
     // Use RwLock to manage concurrency between rips and reconfiguration
     let state = Arc::new(RwLock::new(()));
-
-    // Notification removed as we use RwLock fairness
 
     // Signal handler
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
@@ -96,9 +93,7 @@ async fn main() -> Result<()> {
                 info!("Received Ctrl+C. Shutting down...");
                 // Signal shutdown to all tasks
                 let _ = shutdown_tx.send(());
-                // Wait for tasks to finish?
                 // We can just break and let main exit, which drops tasks.
-                // But explicit wait is cleaner if we want to log completion.
                 break;
             }
         }
@@ -156,7 +151,7 @@ async fn handle_sigusr1(
 ) -> Result<()> {
     // 1) Try to acquire write lock to ensure no rips are active
     // try_write() fails if there are any readers (active rips) or writers
-    let _lock = match state.try_write() {
+    let lock = match state.try_write() {
         Ok(guard) => guard,
         Err(_) => {
             warn!("Cannot reconfigure: Rips active. Ignoring SIGUSR1.");
@@ -174,7 +169,7 @@ async fn handle_sigusr1(
     // We don't need to hold it while discovering/spawning,
     // and we definitely don't want to hold it if spawn takes time.
     // The old tasks are gone, so no rips are happening.
-    drop(_lock);
+    drop(lock);
 
     // 4) Spawn new rip threads
     discover_and_spawn(makemkv, multi_progress, state, args, tasks, shutdown_tx).await?;
@@ -255,7 +250,7 @@ async fn drive_task_loop(
                                 // Permit dropped at end of scope or break
                                 break;
                             }
-                            res = run_rip_workflow(&makemkv, &multi_progress, drive_index, &base_name, &args.output_dir) => res
+                            res = run_rip_workflow(&makemkv, &multi_progress, drive_index, &base_name, &args.output_dir, args.min_length) => res
                         };
 
                         // Release "Rip Permit"
@@ -263,9 +258,7 @@ async fn drive_task_loop(
 
                         if let Err(e) = rip_result {
                             error!("Drive {}: Rip failed: {:?}", drive_index, e);
-                            // If rip failed, do we update signature?
-                            // If we don't, we might retry infinitely.
-                            // Better to update signature so we don't retry same disc immediately.
+                            // Update signature so we don't retry same disc immediately.
                             last_disc_signature = Some(current_signature);
                         } else {
                             info!("Drive {}: Rip complete.", drive_index);
@@ -325,6 +318,7 @@ async fn run_rip_workflow(
     drive_index: usize,
     base_name: &str,
     output_root: &PathBuf,
+    min_length: u64,
 ) -> Result<()> {
     // Determine output folder name with increment
     let final_output_dir = get_incremented_dir(output_root, base_name)?;
@@ -352,33 +346,38 @@ async fn run_rip_workflow(
     let total_bar_clone = total_bar.clone();
     let current_bar_clone = current_bar.clone();
     makemkv
-        .rip_disc(drive_index, &final_output_dir, move |update| match update {
-            makemkv::ProgressUpdate::Progress(p) => {
-                total_bar_clone.set_length(p.max);
-                current_bar_clone.set_length(p.max);
-                total_bar_clone.set_position(p.total);
-                current_bar_clone.set_position(p.current);
-            }
-            makemkv::ProgressUpdate::Message(msg) => {
-                debug!("Drive {}: MakeMKV: {}", drive_index, msg);
-            }
-            makemkv::ProgressUpdate::ProgressTitle(progress_title) => {
-                match progress_title.title_type {
-                    makemkv::ProgressTitleType::Current => {
-                        current_bar_clone.set_message(format!(
-                            "Drive {}: Title {}: {}",
-                            drive_index, progress_title.id, progress_title.name
-                        ));
-                    }
-                    makemkv::ProgressTitleType::Total => {
-                        total_bar_clone.set_message(format!(
-                            "Drive {}: Title {}: {}",
-                            drive_index, progress_title.id, progress_title.name
-                        ));
+        .rip_disc(
+            drive_index,
+            &final_output_dir,
+            min_length,
+            move |update| match update {
+                makemkv::ProgressUpdate::Progress(p) => {
+                    total_bar_clone.set_length(p.max);
+                    current_bar_clone.set_length(p.max);
+                    total_bar_clone.set_position(p.total);
+                    current_bar_clone.set_position(p.current);
+                }
+                makemkv::ProgressUpdate::Message(msg) => {
+                    debug!("Drive {}: MakeMKV: {}", drive_index, msg);
+                }
+                makemkv::ProgressUpdate::ProgressTitle(progress_title) => {
+                    match progress_title.title_type {
+                        makemkv::ProgressTitleType::Current => {
+                            current_bar_clone.set_message(format!(
+                                "Drive {}: Title {}: {}",
+                                drive_index, progress_title.id, progress_title.name
+                            ));
+                        }
+                        makemkv::ProgressTitleType::Total => {
+                            total_bar_clone.set_message(format!(
+                                "Drive {}: Title {}: {}",
+                                drive_index, progress_title.id, progress_title.name
+                            ));
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await?;
 
     current_bar.finish_and_clear();
