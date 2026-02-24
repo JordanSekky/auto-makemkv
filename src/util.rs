@@ -20,18 +20,21 @@ pub fn fmt_bytes(bytes: usize) -> String {
 }
 
 pub fn get_incremented_dir(root: &PathBuf, base_name: &str) -> Result<PathBuf> {
-    // Pattern: NN_BaseName
+    // Pattern: BaseName_NN
     // Find max NN
     let mut max_n = 0;
 
     if root.exists() {
+        if !root.join(base_name).exists() {
+            return Ok(root.join(base_name));
+        }
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Check if name matches NN_BaseName exactly
-                    if let Some((num_str, rest)) = name.split_once('_') {
+                    // Check if name matches BaseName_NN exactly
+                    if let Some((rest, num_str)) = name.rsplit_once('_') {
                         if rest == base_name {
                             if let Ok(num) = num_str.parse::<u32>() {
                                 if num > max_n {
@@ -46,6 +49,6 @@ pub fn get_incremented_dir(root: &PathBuf, base_name: &str) -> Result<PathBuf> {
     }
 
     let next_n = max_n + 1;
-    let folder_name = format!("{:02}_{}", next_n, base_name);
+    let folder_name = format!("{}_{:02}", base_name, next_n);
     Ok(root.join(folder_name))
 }
