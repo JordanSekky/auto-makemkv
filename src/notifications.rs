@@ -1,4 +1,5 @@
 use log::{info, warn};
+use std::error::Error;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -28,12 +29,13 @@ impl Pushover {
     }
 
     pub async fn send_pushover(&self, title: &str, message: &str) {
-        let params = [
-            ("token", &self.app_token),
-            ("user", &self.user_key),
-            ("title", &title.to_string()),
-            ("message", &message.to_string()),
-        ];
+        use std::collections::HashMap;
+
+        let mut params = HashMap::new();
+        params.insert("token", self.app_token.clone());
+        params.insert("user", self.user_key.clone());
+        params.insert("title", title.to_string());
+        params.insert("message", message.to_string());
 
         match self
             .client
@@ -53,7 +55,11 @@ impl Pushover {
                 );
             }
             Err(e) => {
-                warn!("Pushover notification error: {}", e);
+                warn!(
+                    "Pushover notification error: {}: {}",
+                    e,
+                    e.source().map(|s| s.to_string()).unwrap_or_default()
+                );
             }
         }
     }
