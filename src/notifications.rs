@@ -1,0 +1,86 @@
+use log::{info, warn};
+use std::path::Path;
+
+pub struct Pushover {
+    app_token: String,
+    user_key: String,
+    client: reqwest::Client,
+}
+
+impl Pushover {
+    pub fn new(app_token: &str, user_key: &str) -> Self {
+        Self {
+            app_token: app_token.to_string(),
+            user_key: user_key.to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn send_pushover(&self, title: &str, message: &str) {
+        let params = [
+            ("token", &self.app_token),
+            ("user", &self.user_key),
+            ("title", &title.to_string()),
+            ("message", &message.to_string()),
+        ];
+
+        match self
+            .client
+            .post("https://api.pushover.net/1/messages.json")
+            .form(&params)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Pushover notification sent: {}", title);
+            }
+            Ok(resp) => {
+                warn!(
+                    "Pushover notification failed (HTTP {}): {}",
+                    resp.status(),
+                    title
+                );
+            }
+            Err(e) => {
+                warn!("Pushover notification error: {}", e);
+            }
+        }
+    }
+
+    pub async fn notify_rip_started(
+        &self,
+        drive_index: usize,
+        disc_label: &str,
+        output_dir: &Path,
+    ) {
+        self.send_pushover(
+            "Disc rip started",
+            &format!(
+                "Started ripping '{}' (drive {}) to {}",
+                disc_label,
+                drive_index,
+                output_dir.display()
+            ),
+        )
+        .await;
+    }
+
+    pub async fn notify_rip_completed(&self, drive_index: usize, disc_label: &str) {
+        self.send_pushover(
+            "Disc rip complete",
+            &format!(
+                "Successfully ripped '{}' (drive {}).",
+                disc_label, drive_index
+            ),
+        )
+        .await;
+    }
+
+    pub async fn notify_rip_failed(&self, drive_index: usize, disc_label: &str) {
+        self.send_pushover(
+            "Disc rip failed",
+            &format!("Failed to rip '{}' (drive {}).", disc_label, drive_index),
+        )
+        .await;
+    }
+}

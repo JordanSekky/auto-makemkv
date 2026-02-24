@@ -4,19 +4,25 @@ use indicatif::MultiProgress;
 use log::{debug, error, info, warn};
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::fs::File;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
+use walkdir::WalkDir;
 
+pub mod file;
 pub mod filesize_progress_tracker;
 mod makemkv;
+mod notifications;
 mod output;
 
 use makemkv::{Drive, MakeMKV};
 use output::init_logger;
 
+use crate::file::{AsyncReadWithSize, AsyncReadWithSizeImpl, AsyncWriteWithSizeImpl};
+use crate::notifications::Pushover;
 use crate::output::RipProgressTracker;
 
 #[derive(Parser, Debug, Clone)]
@@ -47,18 +53,43 @@ struct Args {
     #[arg(long, env = "AUTO_MAKEMKV_POLL_INTERVAL", default_value = "5")]
     poll_interval: u64,
 
+    /// Directory to move successfully ripped discs into. If provided without --failed-dir,
+    /// all terminal-state rips (success and failure) are moved here.
+    #[arg(long, env = "AUTO_MAKEMKV_COMPLETED_DIR")]
+    completed_dir: Option<PathBuf>,
+
+    /// Directory to move failed rips into. Only used when the rip fails.
+    #[arg(long, env = "AUTO_MAKEMKV_FAILED_DIR")]
+    failed_dir: Option<PathBuf>,
+
+    /// Pushover application token for notifications.
+    #[arg(long, env = "PUSHOVER_APP_TOKEN", requires = "pushover_user_key")]
+    pushover_app_token: Option<String>,
+
+    /// Pushover user key for notifications.
+    #[arg(long, env = "PUSHOVER_USER_KEY", requires = "pushover_app_token")]
+    pushover_user_key: Option<String>,
+
     /// Whether to run with pretty progress bars (default: true if stdout is a terminal)
     #[arg(long, short, action = clap::ArgAction::Set, default_value = if std::io::stdout().is_terminal() { "true" } else { "false" })]
     interactive: bool,
 }
 
-// Shared state removed, using RwLock<()> for synchronization
-// Read lock = active rip
-// Write lock = reconfiguration
+static PUSHOVER: OnceLock<Pushover> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.pushover_app_token.is_some() && args.pushover_user_key.is_some() {
+        PUSHOVER.get_or_init(|| {
+            Pushover::new(
+                args.pushover_app_token.as_deref().unwrap(),
+                args.pushover_user_key.as_deref().unwrap(),
+            )
+        });
+    }
+
     // Initialize MultiProgress and Logger
     let multi_progress = if args.interactive {
         Some(MultiProgress::new())
@@ -263,27 +294,82 @@ async fn drive_task_loop(
                             break;
                         }
 
+                        // Prepare output directory
+                        let final_output_dir =
+                            match get_incremented_dir(&args.output_dir, &base_name) {
+                                Ok(dir) => dir,
+                                Err(e) => {
+                                    error!(
+                                        "Drive {}: Failed to determine output dir: {:?}",
+                                        drive_index, e
+                                    );
+                                    drop(permit);
+                                    last_disc_signature = Some(current_signature);
+                                    continue;
+                                }
+                            };
+                        if let Err(e) = std::fs::create_dir_all(&final_output_dir) {
+                            error!(
+                                "Drive {}: Failed to create output dir: {:?}",
+                                drive_index, e
+                            );
+                            drop(permit);
+                            last_disc_signature = Some(current_signature);
+                            continue;
+                        }
+
+                        if let Some(p) = PUSHOVER.get() {
+                            p.notify_rip_started(drive_index, &base_name, &final_output_dir)
+                                .await;
+                        }
+
                         // Rip
                         let rip_result = tokio::select! {
                             _ = shutdown_rx.recv() => {
                                 info!("Drive {}: Shutdown signal received during rip.", drive_index);
-                                // Permit dropped at end of scope or break
                                 break;
                             }
-                            res = run_rip_workflow(&makemkv, multi_progress.as_ref(), drive_index, &base_name, &args.output_dir, args.min_length) => res
+                            res = run_rip_workflow(&makemkv, multi_progress.as_ref(), drive_index, &base_name, &final_output_dir, args.min_length) => res
                         };
 
                         // Release "Rip Permit"
                         drop(permit);
 
-                        if let Err(e) = rip_result {
-                            error!("Drive {}: Rip failed: {:?}", drive_index, e);
-                            // Update signature so we don't retry same disc immediately.
-                            last_disc_signature = Some(current_signature);
-                        } else {
-                            info!("Drive {}: Rip complete.", drive_index);
-                            last_disc_signature = Some(current_signature);
+                        match &rip_result {
+                            Ok(()) => {
+                                info!("Drive {}: Rip complete.", drive_index);
+                                // If only --failed-dir was given (no --completed-dir), leave
+                                // successes in place. Otherwise use --completed-dir.
+                                move_rip_dir(
+                                    drive_index,
+                                    &final_output_dir,
+                                    args.completed_dir.as_ref(),
+                                )
+                                .await;
+                                if let Some(p) = PUSHOVER.get() {
+                                    p.notify_rip_completed(drive_index, &base_name).await;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Drive {}: Rip failed: {:?}", drive_index, e);
+                                let is_empty = std::fs::read_dir(&final_output_dir)
+                                    .map(|mut d| d.next().is_none())
+                                    .unwrap_or(true);
+                                if is_empty {
+                                    let _ = std::fs::remove_dir(&final_output_dir);
+                                } else {
+                                    // failed_dir wins; if absent but completed_dir is set, use
+                                    // that (move all terminal-state rips there).
+                                    let dest_dir =
+                                        args.failed_dir.as_ref().or(args.completed_dir.as_ref());
+                                    move_rip_dir(drive_index, &final_output_dir, dest_dir).await;
+                                }
+                                if let Some(p) = PUSHOVER.get() {
+                                    p.notify_rip_failed(drive_index, &base_name).await;
+                                }
+                            }
                         }
+                        last_disc_signature = Some(current_signature);
 
                         // Eject
                         info!("Drive {}: Ejecting...", drive_index);
@@ -337,27 +423,21 @@ async fn run_rip_workflow(
     multi_progress: Option<&MultiProgress>,
     drive_index: usize,
     base_name: &str,
-    output_root: &PathBuf,
+    output_dir: &PathBuf,
     min_length: u64,
 ) -> Result<()> {
-    // Determine output folder name with increment
-    let final_output_dir = get_incremented_dir(output_root, base_name)?;
-
-    std::fs::create_dir_all(&final_output_dir)?;
     info!(
         "Drive {}: Ripping {} to {:?}",
-        drive_index, base_name, final_output_dir
+        drive_index, base_name, output_dir
     );
 
-    // Create progress tracker
-    let tracker =
-        RipProgressTracker::new(multi_progress, drive_index, base_name, &final_output_dir);
+    let tracker = RipProgressTracker::new(multi_progress, drive_index, base_name, output_dir);
     let tracker_clone = tracker.clone();
 
     makemkv
         .rip_disc(
             drive_index,
-            &final_output_dir,
+            output_dir,
             min_length,
             move |update| match update {
                 makemkv::ProgressUpdate::Progress(p) => {
@@ -375,6 +455,99 @@ async fn run_rip_workflow(
 
     tracker.finish();
     Ok(())
+}
+
+async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&PathBuf>) {
+    let Some(dest_dir) = dest_dir else { return };
+    if let Err(e) = std::fs::create_dir_all(dest_dir) {
+        error!(
+            "Drive {}: Failed to create destination dir {:?}: {:?}",
+            drive_index, dest_dir, e
+        );
+        return;
+    }
+    let dest = dest_dir.join(src.file_name().unwrap());
+    if let Ok(()) = std::fs::rename(src, &dest) {
+        return;
+    };
+    for entry in WalkDir::new(src)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+    {
+        let rel_path = entry.path().strip_prefix(src).unwrap();
+        let dest_path = dest_dir.join(rel_path);
+        let src_path = entry.into_path();
+        if let Err(e) = move_file_with_progress(drive_index, &src_path, &dest_path).await {
+            error!(
+                "Drive {}: Failed to move file {:?} to {:?}: {:?}",
+                drive_index, src_path, dest_path, e
+            );
+        };
+    }
+}
+
+async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathBuf) -> Result<()> {
+    let src_size = std::fs::metadata(src)?.len();
+    let dest_size = std::fs::metadata(dest)?.len();
+    let mut src_file = File::open(src).await?;
+    src_file.set_max_buf_size(128 * 1024 * 1024); // 128MB
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut dest_file = File::create(dest).await?;
+    dest_file.set_max_buf_size(128 * 1024 * 1024); // 128MB
+    let src_reader = AsyncReadWithSizeImpl::new(src_file, src_size as usize);
+    let dest_writer = AsyncWriteWithSizeImpl::new(dest_file, dest_size as usize);
+
+    // Clone the Arc before moving the reader into the task so we can poll it for progress.
+    let total_read = src_reader.total_read();
+    let total_size = src_reader.total_size();
+
+    let join_handle = tokio::task::spawn(async move {
+        let mut src_reader = src_reader;
+        let mut dest_writer = dest_writer;
+        tokio::io::copy(&mut src_reader, &mut dest_writer).await
+    });
+    let mut progress_interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        progress_interval.tick().await;
+        if join_handle.is_finished() {
+            info!(
+                "Drive {}: File move completed ({}).",
+                drive_index,
+                fmt_bytes(total_size.load(std::sync::atomic::Ordering::Relaxed))
+            );
+            break;
+        }
+        let read = total_read.load(std::sync::atomic::Ordering::Relaxed);
+        let size = total_size.load(std::sync::atomic::Ordering::Relaxed);
+        info!(
+            "Drive {}: {} / {}",
+            drive_index,
+            fmt_bytes(read),
+            fmt_bytes(size),
+        );
+    }
+    Ok(())
+}
+
+fn fmt_bytes(bytes: usize) -> String {
+    const UNITS: &[&str] = &["B", "kB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for &u in &UNITS[1..] {
+        if value < 1000.0 {
+            break;
+        }
+        value /= 1000.0;
+        unit = u;
+    }
+    if unit == "B" {
+        format!("{} B", bytes)
+    } else {
+        format!("{:.2} {}", value, unit)
+    }
 }
 
 fn get_incremented_dir(root: &PathBuf, base_name: &str) -> Result<PathBuf> {
