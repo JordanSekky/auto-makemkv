@@ -194,33 +194,41 @@ async fn drive_task_loop(
                                 info!("Drive {}: Rip complete.", drive_index);
                                 // If only --failed-dir was given (no --completed-dir), leave
                                 // successes in place. Otherwise use --completed-dir.
-                                move_rip_dir(
-                                    drive_index,
-                                    &final_output_dir,
-                                    args.completed_dir.as_ref(),
-                                )
-                                .await;
-                                if let Some(p) = notifications::pushover() {
-                                    p.notify_rip_completed(drive_index, &base_name).await;
-                                }
+                                let completed_dir = args.clone().completed_dir;
+                                tokio::task::spawn(async move {
+                                    move_rip_dir(
+                                        drive_index,
+                                        &final_output_dir,
+                                        completed_dir.as_ref(),
+                                    )
+                                    .await;
+                                    if let Some(p) = notifications::pushover() {
+                                        p.notify_rip_completed(drive_index, &base_name).await;
+                                    }
+                                });
                             }
                             Err(e) => {
                                 error!("Drive {}: Rip failed: {:?}", drive_index, e);
-                                let is_empty = std::fs::read_dir(&final_output_dir)
-                                    .map(|mut d| d.next().is_none())
-                                    .unwrap_or(true);
-                                if is_empty {
-                                    let _ = std::fs::remove_dir(&final_output_dir);
-                                } else {
-                                    // failed_dir wins; if absent but completed_dir is set, use
-                                    // that (move all terminal-state rips there).
-                                    let dest_dir =
-                                        args.failed_dir.as_ref().or(args.completed_dir.as_ref());
-                                    move_rip_dir(drive_index, &final_output_dir, dest_dir).await;
-                                }
-                                if let Some(p) = notifications::pushover() {
-                                    p.notify_rip_failed(drive_index, &base_name).await;
-                                }
+                                let completed_dir = args.clone().completed_dir;
+                                let failed_dir = args.clone().failed_dir;
+                                tokio::task::spawn(async move {
+                                    let is_empty = std::fs::read_dir(&final_output_dir)
+                                        .map(|mut d| d.next().is_none())
+                                        .unwrap_or(true);
+                                    if is_empty {
+                                        let _ = std::fs::remove_dir(&final_output_dir);
+                                    } else {
+                                        // failed_dir wins; if absent but completed_dir is set, use
+                                        // that (move all terminal-state rips there).
+                                        let dest_dir =
+                                            failed_dir.as_ref().or(completed_dir.as_ref());
+                                        move_rip_dir(drive_index, &final_output_dir, dest_dir)
+                                            .await;
+                                    }
+                                    if let Some(p) = notifications::pushover() {
+                                        p.notify_rip_failed(drive_index, &base_name).await;
+                                    }
+                                });
                             }
                         }
                         last_disc_signature = Some(current_signature);
