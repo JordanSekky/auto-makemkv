@@ -89,12 +89,14 @@ impl Display for FilesizeProgressTracker {
         }
 
         if let Some(path) = &self.cur_file {
+            // Safe unwrap: path is guaranteed to be a file in a directory.
+            let display_path = path
+                .strip_prefix(path.parent().unwrap().parent().unwrap())
+                .unwrap();
             write!(
                 f,
                 "{}: {:.2} {} / ~{:.2} {}",
-                path.file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("Unknown"))
-                    .to_string_lossy(),
+                display_path.to_string_lossy(),
                 display_size,
                 unit,
                 display_total,
