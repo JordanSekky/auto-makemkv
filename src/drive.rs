@@ -110,7 +110,7 @@ async fn drive_task_loop(
         }
 
         // 2. Poll for disc info
-        info!("Drive {}: Polling for disc info...", drive_index);
+        debug!("Drive {}: Polling for disc info...", drive_index);
         let disc_info_res = tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!("Drive {}: Shutdown signal received during poll.", drive_index);
@@ -259,7 +259,7 @@ async fn drive_task_loop(
                         info!("Drive {}: Disc removed.", drive_index);
                         last_disc_signature = None;
                     }
-                    info!("Drive {}: Empty.", drive_index);
+                    debug!("Drive {}: Empty.", drive_index);
                 }
             }
             Err(e) => {
