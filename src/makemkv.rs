@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::select;
 
 #[derive(Debug, Clone)]
 pub struct Drive {
@@ -186,23 +187,20 @@ io_RBufSizeMB = "1024"
 
     pub async fn get_disc_info(&self, drive_index: usize) -> Result<(DiscInfo, Vec<Title>)> {
         // makemkvcon -r --noscan --cache=1 info disc:N
-        let output = Command::new("makemkvcon")
+        let mut child = Command::new("makemkvcon")
             .arg("-r")
             .arg("--noscan")
             .arg("info")
             .arg(format!("disc:{}", drive_index))
             .env("HOME", self.home())
             .kill_on_drop(true)
-            .output()
-            .await
-            .context("Failed to execute makemkvcon info")?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn makemkvcon info")?;
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() {
-            return Err(anyhow::anyhow!("makemkvcon info failed: {}", stderr));
-        }
-
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
+        let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let mut disc_info = DiscInfo {
             disc_type: None,
             disc_title: None,
@@ -212,16 +210,39 @@ io_RBufSizeMB = "1024"
         };
         let mut titles: HashMap<usize, Title> = HashMap::new();
 
-        for line in stdout.lines() {
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut stdout_lines = BufReader::new(stdout).lines();
+
+        select! {
+            line = stderr_lines.next_line() => {
+                if let Ok(Some(line)) = line {
+                    debug!("Drive {}: Stderr: {}", drive_index, line);
+                }
+            }
+            line = stdout_lines.next_line() => {
+                if let Ok(Some(line)) = line {
             if line.starts_with("CINFO:") {
-                parse_cinfo_line(line, &mut disc_info);
+                parse_cinfo_line(&line, &mut disc_info);
             } else if line.starts_with("TINFO:") {
-                parse_tinfo_line(line, &mut titles);
+                parse_tinfo_line(&line, &mut titles);
+            } else {
+                debug!("Drive {}: Unhandled line: {}", drive_index, line);
+            }
+                }
             }
         }
 
         let mut sorted_titles: Vec<Title> = titles.into_values().collect();
         sorted_titles.sort_by_key(|t| t.id);
+
+        let status = child
+            .wait()
+            .await
+            .context("Failed to wait for makemkvcon info")?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!("makemkvcon info failed: {}", status));
+        }
 
         Ok((disc_info, sorted_titles))
     }
@@ -255,24 +276,34 @@ io_RBufSizeMB = "1024"
             .context("Failed to spawn makemkvcon rip process")?;
 
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
 
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.starts_with("PRGC:") || line.starts_with("PRGT:") {
-                if let Some(progress_title) = parse_prgc_prgt_line(&line) {
-                    progress_callback(ProgressUpdate::ProgressTitle(progress_title));
+        select! {
+            line = stderr_lines.next_line() => {
+                if let Ok(Some(line)) = line {
+                    debug!("Drive {}: Stderr: {}", drive_index, line);
                 }
-            } else if line.starts_with("PRGV:") {
-                if let Some(progress) = parse_prgv_line(&line) {
-                    progress_callback(ProgressUpdate::Progress(progress));
+            }
+            line = stdout_lines.next_line() => {
+                if let Ok(Some(line)) = line {
+                    if line.starts_with("PRGC:") || line.starts_with("PRGT:") {
+                        if let Some(progress_title) = parse_prgc_prgt_line(&line) {
+                            progress_callback(ProgressUpdate::ProgressTitle(progress_title));
+                        }
+                    } else if line.starts_with("PRGV:") {
+                        if let Some(progress) = parse_prgv_line(&line) {
+                            progress_callback(ProgressUpdate::Progress(progress));
+                        }
+                    } else if line.starts_with("MSG:") {
+                        if let Some(msg) = parse_msg_line(&line) {
+                            progress_callback(ProgressUpdate::Message(msg));
+                        }
+                    } else {
+                        debug!("Drive {}: Unhandled line: {}", drive_index, line);
+                    }
                 }
-            } else if line.starts_with("MSG:") {
-                if let Some(msg) = parse_msg_line(&line) {
-                    progress_callback(ProgressUpdate::Message(msg));
-                }
-            } else {
-                debug!("Unhandled line: {}", line);
             }
         }
 

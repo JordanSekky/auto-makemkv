@@ -4,7 +4,7 @@ use indicatif::MultiProgress;
 use log::info;
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock};
 
 mod cli;
 mod drive;
@@ -18,6 +18,11 @@ mod util;
 
 use cli::Args;
 use output::init_logger;
+
+struct LockState {
+    reconfiguration_active: Mutex<()>,
+    rips_active: RwLock<()>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,24 +57,22 @@ async fn main() -> Result<()> {
     ));
     makemkv.init().context("Failed to initialize MakeMKV")?;
     // Use RwLock to manage concurrency between rips and reconfiguration
-    let state = Arc::new(RwLock::new(()));
+    // Use mutex to prevent multiple reconfigurations from being queued.
+    let state = Arc::new(LockState {
+        reconfiguration_active: Mutex::new(()),
+        rips_active: RwLock::new(()),
+    });
 
     // Signal handler
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
 
-    // Shutdown channel
-    let (shutdown_tx, _) = broadcast::channel(1);
-
-    // Initial discovery and task spawning
-    let mut tasks = Vec::new();
-
+    let mut cancellation_token = tokio_util::sync::CancellationToken::new();
     drive::discover_and_spawn(
         &makemkv,
         multi_progress.as_ref(),
         &state,
         &args,
-        &mut tasks,
-        shutdown_tx.clone(),
+        &mut cancellation_token,
     )
     .await?;
 
@@ -77,22 +80,15 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1. Attempting reconfiguration...");
-                drive::handle_sigusr1(&makemkv, multi_progress.as_ref(), &state, &args, &mut tasks, shutdown_tx.clone()).await?;
+                cancellation_token = drive::handle_sigusr1(&makemkv, multi_progress.as_ref(), &state, &args, cancellation_token.clone()).await?;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C. Shutting down...");
                 // Signal shutdown to all tasks
-                let _ = shutdown_tx.send(());
+                cancellation_token.cancel();
                 break;
             }
         }
     }
-
-    // Wait for tasks to complete
-    for task in tasks {
-        let _ = task.await;
-    }
-    info!("Shutdown complete.");
-
     Ok(())
 }

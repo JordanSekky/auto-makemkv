@@ -3,6 +3,8 @@ use log::error;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::File;
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::file::{AsyncReadWithSize, AsyncReadWithSizeImpl, AsyncWriteWithSizeImpl};
@@ -55,15 +57,24 @@ async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathB
     let total_read = src_reader.total_read();
     let total_size = src_reader.total_size();
 
+    let cancellation_token = CancellationToken::new();
     let join_handle = tokio::task::spawn(async move {
         let mut src_reader = src_reader;
         let mut dest_writer = dest_writer;
-        tokio::io::copy(&mut src_reader, &mut dest_writer).await
+        select! {
+            _ = cancellation_token.cancelled() => {
+                return Err(anyhow::anyhow!("File move cancelled"));
+            }
+            _ = tokio::io::copy(&mut src_reader, &mut dest_writer) => {
+                return Ok(());
+            }
+        }
     });
     let mut progress_interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         progress_interval.tick().await;
         if join_handle.is_finished() {
+            tokio::fs::remove_file(src).await?;
             log::info!(
                 "Drive {}: File move completed ({}).",
                 drive_index,

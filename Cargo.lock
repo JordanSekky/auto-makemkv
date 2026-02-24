@@ -95,6 +95,7 @@ dependencies = [
  "regex",
  "reqwest",
  "tokio",
+ "tokio-util",
  "walkdir",
 ]
 
