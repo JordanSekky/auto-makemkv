@@ -1,5 +1,16 @@
 use log::{info, warn};
 use std::path::Path;
+use std::sync::OnceLock;
+
+static PUSHOVER: OnceLock<Pushover> = OnceLock::new();
+
+pub fn init_pushover(app_token: &str, user_key: &str) {
+    PUSHOVER.get_or_init(|| Pushover::new(app_token, user_key));
+}
+
+pub fn pushover() -> Option<&'static Pushover> {
+    PUSHOVER.get()
+}
 
 pub struct Pushover {
     app_token: String,
