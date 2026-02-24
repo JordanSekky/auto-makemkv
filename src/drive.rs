@@ -111,12 +111,37 @@ async fn drive_task_loop(
 
         // 2. Poll for disc info
         debug!("Drive {}: Polling for disc info...", drive_index);
-        let disc_info_res = tokio::select! {
-            _ = shutdown_rx.recv() => {
-                info!("Drive {}: Shutdown signal received during poll.", drive_index);
-                break;
+        let disc_info_res = loop {
+            let res = tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Drive {}: Shutdown signal received during poll.", drive_index);
+                    break None;
+                }
+                res = tokio::time::timeout(Duration::from_secs(60), makemkv.get_disc_info(drive_index)) => res,
+            };
+
+            match res {
+                Ok(Ok(ok)) => break Some(ok),
+                Ok(Err(e)) => {
+                    error!("Drive {}: Error getting disc info: {:?}", drive_index, e);
+                    // Wait and retry
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(_elapsed) => {
+                    // Timeout occurred. Log and retry.
+                    warn!(
+                        "Drive {}: Timeout getting disc info, retrying in 5s...",
+                        drive_index
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             }
-            res = makemkv.get_disc_info(drive_index) => res
+        };
+        let disc_info_res: anyhow::Result<_> = match disc_info_res {
+            Some(ok) => Ok(ok),
+            None => break,
         };
 
         match disc_info_res {
