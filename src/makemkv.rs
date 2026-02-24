@@ -213,32 +213,32 @@ io_RBufSizeMB = "1024"
         let mut stderr_lines = BufReader::new(stderr).lines();
         let mut stdout_lines = BufReader::new(stdout).lines();
 
-        select! {
-            line = stderr_lines.next_line() => {
-                if let Ok(Some(line)) = line {
-                    debug!("Drive {}: Stderr: {}", drive_index, line);
+        let status = loop {
+            select! {
+                line = stderr_lines.next_line() => {
+                    if let Ok(Some(line)) = line {
+                        debug!("Drive {}: Stderr: {}", drive_index, line);
+                    }
+                }
+                line = stdout_lines.next_line() => {
+                    if let Ok(Some(line)) = line {
+                if line.starts_with("CINFO:") {
+                    parse_cinfo_line(&line, &mut disc_info);
+                } else if line.starts_with("TINFO:") {
+                    parse_tinfo_line(&line, &mut titles);
+                } else {
+                    debug!("Drive {}: Unhandled line: {}", drive_index, line);
+                }
+                    }
+                }
+                status = child.wait() => {
+                    break status.expect("Failed to wait for makemkvcon info");
                 }
             }
-            line = stdout_lines.next_line() => {
-                if let Ok(Some(line)) = line {
-            if line.starts_with("CINFO:") {
-                parse_cinfo_line(&line, &mut disc_info);
-            } else if line.starts_with("TINFO:") {
-                parse_tinfo_line(&line, &mut titles);
-            } else {
-                debug!("Drive {}: Unhandled line: {}", drive_index, line);
-            }
-                }
-            }
-        }
+        };
 
         let mut sorted_titles: Vec<Title> = titles.into_values().collect();
         sorted_titles.sort_by_key(|t| t.id);
-
-        let status = child
-            .wait()
-            .await
-            .context("Failed to wait for makemkvcon info")?;
 
         if !status.success() {
             return Err(anyhow::anyhow!("makemkvcon info failed: {}", status));
@@ -280,37 +280,37 @@ io_RBufSizeMB = "1024"
         let mut stdout_lines = BufReader::new(stdout).lines();
         let mut stderr_lines = BufReader::new(stderr).lines();
 
-        select! {
-            line = stderr_lines.next_line() => {
-                if let Ok(Some(line)) = line {
-                    debug!("Drive {}: Stderr: {}", drive_index, line);
-                }
-            }
-            line = stdout_lines.next_line() => {
-                if let Ok(Some(line)) = line {
-                    if line.starts_with("PRGC:") || line.starts_with("PRGT:") {
-                        if let Some(progress_title) = parse_prgc_prgt_line(&line) {
-                            progress_callback(ProgressUpdate::ProgressTitle(progress_title));
-                        }
-                    } else if line.starts_with("PRGV:") {
-                        if let Some(progress) = parse_prgv_line(&line) {
-                            progress_callback(ProgressUpdate::Progress(progress));
-                        }
-                    } else if line.starts_with("MSG:") {
-                        if let Some(msg) = parse_msg_line(&line) {
-                            progress_callback(ProgressUpdate::Message(msg));
-                        }
-                    } else {
-                        debug!("Drive {}: Unhandled line: {}", drive_index, line);
+        let status = loop {
+            select! {
+                line = stderr_lines.next_line() => {
+                    if let Ok(Some(line)) = line {
+                        debug!("Drive {}: Stderr: {}", drive_index, line);
                     }
                 }
+                line = stdout_lines.next_line() => {
+                    if let Ok(Some(line)) = line {
+                        if line.starts_with("PRGC:") || line.starts_with("PRGT:") {
+                            if let Some(progress_title) = parse_prgc_prgt_line(&line) {
+                                progress_callback(ProgressUpdate::ProgressTitle(progress_title));
+                            }
+                        } else if line.starts_with("PRGV:") {
+                            if let Some(progress) = parse_prgv_line(&line) {
+                                progress_callback(ProgressUpdate::Progress(progress));
+                            }
+                        } else if line.starts_with("MSG:") {
+                            if let Some(msg) = parse_msg_line(&line) {
+                                progress_callback(ProgressUpdate::Message(msg));
+                            }
+                        } else {
+                            debug!("Drive {}: Unhandled line: {}", drive_index, line);
+                        }
+                    }
+                }
+                status = child.wait() => {
+                    break status.expect("Failed to wait for makemkvcon process");
+                }
             }
-        }
-
-        let status = child
-            .wait()
-            .await
-            .context("Failed to wait for makemkvcon process")?;
+        };
         if !status.success() {
             return Err(anyhow::anyhow!(
                 "makemkvcon rip process failed with exit code: {:?}",
