@@ -119,7 +119,10 @@ impl MakeMKV {
         use std::fs;
         use std::io::Write;
 
-        let config_path = self.settings_dir.as_ref().map(|s| s.join("settings.conf"));
+        let config_path = self
+            .settings_dir
+            .as_ref()
+            .map(|s| s.join(".MakeMKV/settings.conf"));
 
         if config_path.is_some() && !config_path.clone().unwrap().exists() && self.key.is_some() {
             let mut file = fs::File::create(config_path.as_ref().unwrap())?;
