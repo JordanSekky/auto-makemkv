@@ -28,7 +28,7 @@ pub async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&P
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
     {
-        let rel_path = entry.path().strip_prefix(src).unwrap();
+        let rel_path = entry.path().strip_prefix(src.parent().unwrap()).unwrap();
         let dest_path = dest_dir.join(rel_path);
         let src_path = entry.into_path();
         if let Err(e) = move_file_with_progress(drive_index, &src_path, &dest_path).await {
@@ -42,7 +42,6 @@ pub async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&P
 
 async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathBuf) -> Result<()> {
     let src_size = std::fs::metadata(src)?.len();
-    let dest_size = std::fs::metadata(dest)?.len();
     let mut src_file = File::open(src).await?;
     src_file.set_max_buf_size(128 * 1024 * 1024); // 128MB
     if let Some(parent) = dest.parent() {
@@ -51,7 +50,7 @@ async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathB
     let mut dest_file = File::create(dest).await?;
     dest_file.set_max_buf_size(128 * 1024 * 1024); // 128MB
     let src_reader = AsyncReadWithSizeImpl::new(src_file, src_size as usize);
-    let dest_writer = AsyncWriteWithSizeImpl::new(dest_file, dest_size as usize);
+    let dest_writer = AsyncWriteWithSizeImpl::new(dest_file, src_size as usize);
 
     // Clone the Arc before moving the reader into the task so we can poll it for progress.
     let total_read = src_reader.total_read();
