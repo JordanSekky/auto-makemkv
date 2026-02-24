@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.12" }
+reqwest = { version = "0.12", features = ["socks"] }
 anyhow = "1.0.102"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["env", "derive"] }
