@@ -31,16 +31,26 @@ pub async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&P
         let rel_path = entry.path().strip_prefix(src.parent().unwrap()).unwrap();
         let dest_path = dest_dir.join(rel_path);
         let src_path = entry.into_path();
-        if let Err(e) = move_file_with_progress(drive_index, &src_path, &dest_path).await {
+        if let Err(e) = move_file_with_progress(&src_path, &dest_path).await {
             error!(
                 "Drive {}: Failed to move file {:?} to {:?}: {:?}",
                 drive_index, src_path, dest_path, e
             );
         };
     }
+    if let Err(e) = std::fs::remove_dir(&dest) {
+        error!(
+            "Drive {}: Failed to remove directory {:?}: {:?}",
+            drive_index, dest, e
+        );
+    }
 }
 
-async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathBuf) -> Result<()> {
+async fn move_file_with_progress(src: &PathBuf, dest: &PathBuf) -> Result<()> {
+    // Safe unwrap: src is guaranteed to be a file in a directory.
+    let display_path = src
+        .strip_prefix(src.parent().unwrap().parent().unwrap())
+        .unwrap();
     let src_size = std::fs::metadata(src)?.len();
     let mut src_file = File::open(src).await?;
     src_file.set_max_buf_size(128 * 1024 * 1024); // 128MB
@@ -75,8 +85,8 @@ async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathB
         if join_handle.is_finished() {
             tokio::fs::remove_file(src).await?;
             log::info!(
-                "Drive {}: File move completed ({}).",
-                drive_index,
+                "{}: File move completed ({}).",
+                display_path.to_string_lossy(),
                 fmt_bytes(total_size.load(std::sync::atomic::Ordering::Relaxed))
             );
             break;
@@ -84,8 +94,8 @@ async fn move_file_with_progress(drive_index: usize, src: &PathBuf, dest: &PathB
         let read = total_read.load(std::sync::atomic::Ordering::Relaxed);
         let size = total_size.load(std::sync::atomic::Ordering::Relaxed);
         log::info!(
-            "Drive {}: {} / {}",
-            drive_index,
+            "{}: {} / {}",
+            display_path.to_string_lossy(),
             fmt_bytes(read),
             fmt_bytes(size),
         );
