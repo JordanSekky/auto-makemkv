@@ -271,6 +271,7 @@ io_RBufSizeMB = "1024"
             .arg(output_dir)
             .env("HOME", self.home())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn makemkvcon rip process")?;
