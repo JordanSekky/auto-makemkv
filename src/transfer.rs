@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::select;
-use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::file::{AsyncReadWithSize, AsyncReadWithSizeImpl, AsyncWriteWithSizeImpl};
@@ -23,11 +22,17 @@ pub async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&P
     if let Ok(()) = std::fs::rename(src, &dest) {
         return;
     };
-    for entry in WalkDir::new(src)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-    {
+    for entry in WalkDir::new(src).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                error!("Drive {}: Failed to walk {:?}: {:?}", drive_index, src, e);
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let rel_path = entry.path().strip_prefix(src.parent().unwrap()).unwrap();
         let dest_path = dest_dir.join(rel_path);
         let src_path = entry.into_path();
@@ -38,11 +43,17 @@ pub async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&P
             );
         };
     }
-    if let Err(e) = std::fs::remove_dir(&dest) {
-        error!(
-            "Drive {}: Failed to remove directory {:?}: {:?}",
-            drive_index, dest, e
-        );
+    // Clean up now-empty directories left behind in src, bottom-up. Any
+    // directory that still contains a file (because that file failed to
+    // move above) is left in place rather than reported as an error.
+    for entry in WalkDir::new(src)
+        .contents_first(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_dir() {
+            let _ = std::fs::remove_dir(entry.path());
+        }
     }
 }
 
@@ -66,39 +77,38 @@ async fn move_file_with_progress(src: &PathBuf, dest: &PathBuf) -> Result<()> {
     let total_read = src_reader.total_read();
     let total_size = src_reader.total_size();
 
-    let cancellation_token = CancellationToken::new();
-    let join_handle = tokio::task::spawn(async move {
+    let mut join_handle = tokio::task::spawn(async move {
         let mut src_reader = src_reader;
         let mut dest_writer = dest_writer;
-        select! {
-            _ = cancellation_token.cancelled() => {
-                return Err(anyhow::anyhow!("File move cancelled"));
-            }
-            _ = tokio::io::copy(&mut src_reader, &mut dest_writer) => {
-                return Ok(());
-            }
-        }
+        tokio::io::copy(&mut src_reader, &mut dest_writer).await?;
+        Ok::<(), std::io::Error>(())
     });
     let mut progress_interval = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        progress_interval.tick().await;
-        if join_handle.is_finished() {
-            tokio::fs::remove_file(src).await?;
-            log::info!(
-                "{}: File move completed ({}).",
-                display_path.to_string_lossy(),
-                fmt_bytes(total_size.load(std::sync::atomic::Ordering::Relaxed))
-            );
-            break;
+    let copy_result = loop {
+        select! {
+            result = &mut join_handle => {
+                break result?;
+            }
+            _ = progress_interval.tick() => {
+                let read = total_read.load(std::sync::atomic::Ordering::Relaxed);
+                let size = total_size.load(std::sync::atomic::Ordering::Relaxed);
+                log::info!(
+                    "{}: {} / {}",
+                    display_path.to_string_lossy(),
+                    fmt_bytes(read),
+                    fmt_bytes(size),
+                );
+            }
         }
-        let read = total_read.load(std::sync::atomic::Ordering::Relaxed);
-        let size = total_size.load(std::sync::atomic::Ordering::Relaxed);
-        log::info!(
-            "{}: {} / {}",
-            display_path.to_string_lossy(),
-            fmt_bytes(read),
-            fmt_bytes(size),
-        );
-    }
+    };
+    // Only delete the source once the copy has actually succeeded, so a
+    // failed/partial copy never leaves us with no complete copy anywhere.
+    copy_result?;
+    tokio::fs::remove_file(src).await?;
+    log::info!(
+        "{}: File move completed ({}).",
+        display_path.to_string_lossy(),
+        fmt_bytes(total_size.load(std::sync::atomic::Ordering::Relaxed))
+    );
     Ok(())
 }
