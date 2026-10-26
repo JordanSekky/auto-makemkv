@@ -1,5 +1,6 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 pub fn fmt_bytes(bytes: usize) -> String {
     const UNITS: &[&str] = &["B", "kB", "MB", "GB", "TB"];
@@ -17,6 +18,14 @@ pub fn fmt_bytes(bytes: usize) -> String {
     } else {
         format!("{:.2} {}", value, unit)
     }
+}
+
+pub fn count_files(dir: &Path) -> usize {
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count()
 }
 
 pub fn get_incremented_dir(root: &PathBuf, base_name: &str) -> Result<PathBuf> {

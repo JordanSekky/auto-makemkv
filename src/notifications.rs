@@ -93,10 +93,13 @@ impl Pushover {
         .await;
     }
 
-    pub async fn notify_rip_failed(&self, drive_index: usize, disc_label: &str) {
+    pub async fn notify_rip_failed(&self, drive_index: usize, disc_label: &str, detail: &str) {
         self.send_pushover(
             "Disc rip failed",
-            &format!("Failed to rip '{}' (drive {}).", disc_label, drive_index),
+            &format!(
+                "Failed to rip '{}' (drive {}): {}.",
+                disc_label, drive_index, detail
+            ),
         )
         .await;
     }

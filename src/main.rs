@@ -4,15 +4,17 @@ use indicatif::MultiProgress;
 use log::info;
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 mod cli;
+mod device;
 mod drive;
 pub mod file;
 pub mod filesize_progress_tracker;
 mod makemkv;
 mod notifications;
 mod output;
+mod rip_outcome;
 mod transfer;
 mod util;
 
@@ -22,6 +24,8 @@ use output::init_logger;
 struct LockState {
     reconfiguration_active: Mutex<()>,
     rips_active: RwLock<()>,
+    // Set by a drive task that finds the kernel has renumbered drives.
+    rediscovery_requested: Notify,
 }
 
 #[tokio::main]
@@ -61,6 +65,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(LockState {
         reconfiguration_active: Mutex::new(()),
         rips_active: RwLock::new(()),
+        rediscovery_requested: Notify::new(),
     });
 
     // Signal handler
@@ -80,6 +85,10 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1. Attempting reconfiguration...");
+                cancellation_token = drive::handle_sigusr1(&makemkv, multi_progress.as_ref(), &state, &args, cancellation_token.clone()).await?;
+            }
+            _ = state.rediscovery_requested.notified() => {
+                info!("Drive numbering changed. Attempting reconfiguration...");
                 cancellation_token = drive::handle_sigusr1(&makemkv, multi_progress.as_ref(), &state, &args, cancellation_token.clone()).await?;
             }
             _ = tokio::signal::ctrl_c() => {

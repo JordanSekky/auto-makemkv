@@ -22,6 +22,14 @@ pub async fn move_rip_dir(drive_index: usize, src: &PathBuf, dest_dir: Option<&P
     if let Ok(()) = std::fs::rename(src, &dest) {
         return;
     };
+    // Create the rip's directory up front so that even a rip with no files leaves a trace.
+    if let Err(e) = std::fs::create_dir_all(&dest) {
+        error!(
+            "Drive {}: Failed to create destination dir {:?}: {:?}",
+            drive_index, dest, e
+        );
+        return;
+    }
     for entry in WalkDir::new(src).into_iter() {
         let entry = match entry {
             Ok(entry) => entry,

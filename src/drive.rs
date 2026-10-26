@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indicatif::MultiProgress;
 use log::{debug, error, info, warn};
 use std::path::PathBuf;
@@ -8,10 +8,14 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Args;
-use crate::makemkv::{DiscInfo, Drive, MakeMKV, ProgressUpdate, Title};
+use crate::device;
+use crate::makemkv::{
+    DiscInfo, Drive, MakeMKV, ProgressUpdate, RipReport, Title, count_titles_to_rip,
+};
 use crate::output::RipProgressTracker;
+use crate::rip_outcome::{RipOutcome, evaluate_rip};
 use crate::transfer::move_rip_dir;
-use crate::util::get_incremented_dir;
+use crate::util::{count_files, get_incremented_dir};
 use crate::{LockState, notifications};
 
 pub async fn discover_and_spawn(
@@ -29,8 +33,16 @@ pub async fn discover_and_spawn(
     } else {
         info!("Found {} drives.", drives.len());
     }
+    for mut drive in drives {
+        info!(
+            "Drive {}: '{}' at {} ({:?})",
+            drive.index,
+            drive.drive_name,
+            drive.device_path.as_deref().unwrap_or("<no device path>"),
+            drive.state
+        );
+        identify_drive(&mut drive);
 
-    for drive in drives {
         let makemkv = makemkv.clone();
         let multi_progress = multi_progress.cloned();
         let state = state.clone();
@@ -116,7 +128,7 @@ async fn drive_task_loop(
         tokio::time::sleep(Duration::from_secs(args.poll_interval)).await;
 
         debug!("Drive {}: Polling for disc info...", drive_index);
-        let (disc_info, _titles) = poll_disc_info(&makemkv, drive_index).await;
+        let (disc_info, titles) = poll_disc_info(&makemkv, drive_index).await;
 
         if disc_info.disc_type.is_none() {
             debug!("Drive {}: No disc detected.", drive_index);
@@ -134,6 +146,7 @@ async fn drive_task_loop(
                 multi_progress.as_ref(),
                 &drive,
                 &disc_info,
+                &titles,
                 &state,
                 &args,
                 &cancellation_token,
@@ -221,30 +234,24 @@ fn spawn_post_rip_success(
     });
 }
 
-/// Spawns a background task to clean up or move a failed rip directory and send a failure
-/// notification.
+/// Spawns a background task to move a failed or partial rip directory and send a failure
+/// notification. The directory is kept even if empty, so the failed rip leaves a trace.
 fn spawn_post_rip_failure(
     drive_index: usize,
     final_output_dir: PathBuf,
     base_name: String,
+    detail: String,
     completed_dir: Option<PathBuf>,
     failed_dir: Option<PathBuf>,
     cancellation_token: CancellationToken,
 ) {
     let move_future = async move {
-        let is_empty = std::fs::read_dir(&final_output_dir)
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(true);
-        if is_empty {
-            let _ = std::fs::remove_dir(&final_output_dir);
-        } else {
-            // failed_dir wins; if absent but completed_dir is set, use
-            // that (move all terminal-state rips there).
-            let dest_dir = failed_dir.as_ref().or(completed_dir.as_ref());
-            move_rip_dir(drive_index, &final_output_dir, dest_dir).await;
-        }
+        // failed_dir wins; if absent but completed_dir is set, use
+        // that (move all terminal-state rips there).
+        let dest_dir = failed_dir.as_ref().or(completed_dir.as_ref());
+        move_rip_dir(drive_index, &final_output_dir, dest_dir).await;
         if let Some(p) = notifications::pushover() {
-            p.notify_rip_failed(drive_index, &base_name).await;
+            p.notify_rip_failed(drive_index, &base_name, &detail).await;
         }
     };
 
@@ -265,6 +272,7 @@ async fn process_new_disc(
     multi_progress: Option<&MultiProgress>,
     drive: &Drive,
     disc_info: &DiscInfo,
+    titles: &[Title],
     state: &Arc<LockState>,
     args: &Args,
     cancellation_token: &CancellationToken,
@@ -278,6 +286,39 @@ async fn process_new_disc(
     // the future is dropped. We don't need to manually cancel the future
     // using try_read().
     let permit = state.rips_active.read().await;
+
+    // The index and device path were assigned at discovery. If the kernel has renumbered this
+    // drive since, MakeMKV's numbering may have changed too, so disc:{index} could now be a
+    // different drive. Re-discover (once no rips are running) instead of ripping.
+    if drive.identity.is_some() {
+        match current_device_path(drive) {
+            Ok(path) if drive.device_path.as_ref() == Some(&path) => {}
+            Ok(path) => {
+                warn!(
+                    "Drive {}: Now at {} (was {}). Re-discovering drives before ripping {}.",
+                    drive_index,
+                    path,
+                    drive.device_path.as_deref().unwrap_or("<none>"),
+                    base_name
+                );
+                drop(permit);
+                state.rediscovery_requested.notify_one();
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "Drive {}: Not ripping {}: {:#}. Send SIGUSR1 to re-discover drives.",
+                    drive_index, base_name, e
+                );
+                drop(permit);
+                if let Some(p) = notifications::pushover() {
+                    p.notify_rip_failed(drive_index, &base_name, "drive not found")
+                        .await;
+                }
+                return;
+            }
+        }
+    }
 
     // Prepare output directory
     let final_output_dir = match prepare_output_dir(&args.output_dir, &base_name, drive_index) {
@@ -307,9 +348,34 @@ async fn process_new_disc(
     // Release "Rip Permit"
     drop(permit);
 
-    match &rip_result {
-        Ok(()) => {
-            info!("Drive {}: Rip complete.", drive_index);
+    let outcome = match &rip_result {
+        Ok(report) => {
+            for title_error in &report.title_errors {
+                error!("Drive {}: {}", drive_index, title_error);
+            }
+            evaluate_rip(
+                report,
+                count_titles_to_rip(titles, args.min_length),
+                count_files(&final_output_dir),
+            )
+        }
+        Err(e) => {
+            error!("Drive {}: Rip failed: {:?}", drive_index, e);
+            RipOutcome::Incomplete {
+                titles_saved: 0,
+                titles_expected: count_titles_to_rip(titles, args.min_length),
+                reasons: vec![format!("{:#}", e)],
+            }
+        }
+    };
+
+    match outcome {
+        RipOutcome::Complete { .. } => {
+            info!(
+                "Drive {}: Rip complete ({}).",
+                drive_index,
+                outcome.summary()
+            );
             spawn_post_rip_success(
                 drive_index,
                 final_output_dir,
@@ -318,12 +384,17 @@ async fn process_new_disc(
                 cancellation_token.clone(),
             );
         }
-        Err(e) => {
-            error!("Drive {}: Rip failed: {:?}", drive_index, e);
+        RipOutcome::Incomplete { .. } => {
+            error!(
+                "Drive {}: Rip incomplete ({}).",
+                drive_index,
+                outcome.summary()
+            );
             spawn_post_rip_failure(
                 drive_index,
                 final_output_dir,
                 base_name,
+                outcome.summary(),
                 args.completed_dir.clone(),
                 args.failed_dir.clone(),
                 cancellation_token.clone(),
@@ -331,10 +402,17 @@ async fn process_new_disc(
         }
     }
 
-    // Eject
-    info!("Drive {}: Ejecting...", drive_index);
-    if let Err(e) = makemkv.eject_disc(drive).await {
-        error!("Drive {}: Eject failed: {:?}", drive_index, e);
+    // Eject. Leaving the disc in is harmless; ejecting the wrong drive aborts its rip, so
+    // don't eject unless this drive can be found.
+    match current_device_path(drive) {
+        Ok(path) => {
+            info!("Drive {}: Ejecting {}...", drive_index, path);
+            match device::eject(&path).await {
+                Ok(()) => info!("Drive {}: Ejected {}.", drive_index, path),
+                Err(e) => error!("Drive {}: {:#}", drive_index, e),
+            }
+        }
+        Err(e) => error!("Drive {}: Not ejecting: {:#}", drive_index, e),
     }
 
     // We do NOT wait for removal here explicitly.
@@ -344,6 +422,51 @@ async fn process_new_disc(
     // We will just loop and sleep until signature changes (disc removed -> None, or new disc).
 }
 
+/// Records the drive's sysfs identity, so it can be found again if its device node is renumbered.
+#[cfg(target_os = "linux")]
+fn identify_drive(drive: &mut Drive) {
+    let Some(path) = drive.device_path.as_deref().filter(|p| !p.is_empty()) else {
+        warn!(
+            "Drive {}: No device path; it won't be ejected.",
+            drive.index
+        );
+        return;
+    };
+    match device::identify_unique(std::path::Path::new(device::SYSFS_ROOT), path) {
+        Ok(identity) => {
+            info!("Drive {}: {} is {}", drive.index, path, identity);
+            drive.identity = Some(identity);
+        }
+        Err(e) => warn!(
+            "Drive {}: Can't identify {} ({:#}); it won't be ejected or checked before rips.",
+            drive.index, path, e
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn identify_drive(_drive: &mut Drive) {}
+
+/// The drive's device path now, looked up by its identity rather than taken from discovery.
+#[cfg(target_os = "linux")]
+fn current_device_path(drive: &Drive) -> Result<String> {
+    let identity = drive
+        .identity
+        .as_ref()
+        .context("drive was not identified at discovery")?;
+    device::current_device_path(std::path::Path::new(device::SYSFS_ROOT), identity)
+}
+
+/// Without sysfs there's nothing to re-check against, so this is the path from discovery.
+#[cfg(not(target_os = "linux"))]
+fn current_device_path(drive: &Drive) -> Result<String> {
+    drive
+        .device_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .context("drive has no device path")
+}
+
 async fn run_rip_workflow(
     makemkv: &MakeMKV,
     multi_progress: Option<&MultiProgress>,
@@ -351,7 +474,7 @@ async fn run_rip_workflow(
     base_name: &str,
     output_dir: &std::path::PathBuf,
     min_length: u64,
-) -> Result<()> {
+) -> Result<RipReport> {
     info!(
         "Drive {}: Ripping {} to {:?}",
         drive_index, base_name, output_dir
@@ -360,7 +483,7 @@ async fn run_rip_workflow(
     let tracker = RipProgressTracker::new(multi_progress, drive_index, base_name, output_dir);
     let tracker_clone = tracker.clone();
 
-    makemkv
+    let report = makemkv
         .rip_disc(
             drive_index,
             output_dir,
@@ -370,7 +493,10 @@ async fn run_rip_workflow(
                     tracker_clone.update_progress(&p);
                 }
                 ProgressUpdate::Message(msg) => {
-                    debug!("Drive {}: MakeMKV: {}", drive_index, msg);
+                    info!(
+                        "Drive {}: MakeMKV: [{}] {}",
+                        drive_index, msg.code, msg.text
+                    );
                 }
                 ProgressUpdate::ProgressTitle(progress_title) => {
                     tracker_clone.update_title(&progress_title);
@@ -380,5 +506,5 @@ async fn run_rip_workflow(
         .await?;
 
     tracker.finish();
-    Ok(())
+    Ok(report)
 }

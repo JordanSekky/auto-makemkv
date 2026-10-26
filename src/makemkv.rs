@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::debug;
+use log::{debug, info, warn};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,12 +8,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::select;
 
+use crate::device::DeviceIdentity;
+
 #[derive(Debug, Clone)]
 pub struct Drive {
     pub index: usize,
     pub drive_name: String,
     pub disc_name: String,
+    // Device path when the drive was discovered. The kernel can renumber it later, so look the
+    // drive up by `identity` before using it.
     pub device_path: Option<String>,
+    pub identity: Option<DeviceIdentity>,
     pub state: DriveState,
 }
 
@@ -98,6 +103,77 @@ pub struct Title {
     pub disk_size: Option<String>,
     pub disk_size_bytes: Option<u64>,
     pub output_filename: Option<String>,
+}
+
+impl Title {
+    // TINFO:9 is formatted as "h:mm:ss".
+    pub fn duration_secs(&self) -> Option<u64> {
+        let mut secs = 0;
+        for part in self.duration.as_deref()?.split(':') {
+            secs = secs * 60 + part.trim().parse::<u64>().ok()?;
+        }
+        Some(secs)
+    }
+}
+
+/// Number of titles a rip with `--minlength=min_length` is expected to save. Titles with an
+/// unknown duration are counted, so a rip that loses them is not mistaken for a clean one.
+pub fn count_titles_to_rip(titles: &[Title], min_length: u64) -> u32 {
+    titles
+        .iter()
+        .filter(|t| t.duration_secs().map_or(true, |d| d >= min_length))
+        .count() as u32
+}
+
+// MSG codes from `makemkvcon -r`, checked against MakeMKV v2.0.0's message catalog and output.
+pub const MSG_TITLE_SAVE_FAILED: u32 = 5003; // "Failed to save title %1 to file %2"
+pub const MSG_TITLES_SAVED_FAILED: u32 = 5004; // "%1 titles saved, %2 failed"
+pub const MSG_TITLES_SAVED: u32 = 5005; // "%1 titles saved"
+pub const MSG_SAVING_TITLES: u32 = 5014; // "Saving %1 titles into directory %2"
+pub const MSG_COPY_COMPLETE: u32 = 5036; // "Copy complete. %1 titles saved."
+pub const MSG_COPY_COMPLETE_FAILED: u32 = 5037; // "Copy complete. %1 titles saved, %2 failed."
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub code: u32,
+    pub _flags: u32,
+    pub text: String,
+    pub params: Vec<String>,
+}
+
+impl Message {
+    fn param_u32(&self, i: usize) -> Option<u32> {
+        self.params.get(i)?.parse().ok()
+    }
+}
+
+/// What a `makemkvcon mkv` run reported. makemkvcon exits 0 even when titles fail, so the
+/// outcome has to come from its messages.
+#[derive(Debug, Clone, Default)]
+pub struct RipReport {
+    pub exit_code: Option<i32>,
+    pub titles_to_save: Option<u32>,
+    pub titles_saved: Option<u32>,
+    pub titles_failed: Option<u32>,
+    pub title_errors: Vec<String>,
+}
+
+impl RipReport {
+    pub fn observe(&mut self, msg: &Message) {
+        match msg.code {
+            MSG_SAVING_TITLES => self.titles_to_save = msg.param_u32(0),
+            MSG_TITLES_SAVED | MSG_COPY_COMPLETE => {
+                self.titles_saved = msg.param_u32(0);
+                self.titles_failed = Some(0);
+            }
+            MSG_TITLES_SAVED_FAILED | MSG_COPY_COMPLETE_FAILED => {
+                self.titles_saved = msg.param_u32(0);
+                self.titles_failed = msg.param_u32(1);
+            }
+            MSG_TITLE_SAVE_FAILED => self.title_errors.push(msg.text.clone()),
+            _ => {}
+        }
+    }
 }
 
 pub struct MakeMKV {
@@ -253,7 +329,7 @@ io_RBufSizeMB = "1024"
         output_dir: &PathBuf,
         min_length: u64,
         progress_callback: F,
-    ) -> Result<()>
+    ) -> Result<RipReport>
     where
         F: Fn(ProgressUpdate) + Send + Sync + 'static,
     {
@@ -280,12 +356,13 @@ io_RBufSizeMB = "1024"
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
         let mut stdout_lines = BufReader::new(stdout).lines();
         let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut report = RipReport::default();
 
         let status = loop {
             select! {
                 line = stderr_lines.next_line() => {
                     if let Ok(Some(line)) = line {
-                        debug!("Drive {}: Stderr: {}", drive_index, line);
+                        warn!("Drive {}: Stderr: {}", drive_index, line);
                     }
                 }
                 line = stdout_lines.next_line() => {
@@ -300,6 +377,7 @@ io_RBufSizeMB = "1024"
                             }
                         } else if line.starts_with("MSG:") {
                             if let Some(msg) = parse_msg_line(&line) {
+                                report.observe(&msg);
                                 progress_callback(ProgressUpdate::Message(msg));
                             }
                         } else {
@@ -312,69 +390,26 @@ io_RBufSizeMB = "1024"
                 }
             }
         };
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "makemkvcon rip process failed with exit code: {:?}",
-                status.code()
-            ));
-        }
-
-        Ok(())
-    }
-
-    pub async fn eject_disc(&self, drive: &Drive) -> Result<()> {
-        // macOS: drutil eject
-        // Linux: eject <device_path>
-        // We are on darwin
-        #[cfg(target_os = "macos")]
-        {
-            // drutil eject seems to eject the first drive or we can specify?
-            // drutil eject -drive internal
-            // But we might have external.
-            // drutil uses a different enumeration.
-            // Let's try "eject <device_path>" first if available, or fallback to drutil.
-            // Actually, 'eject' command might not be available on macOS by default?
-            // macOS has 'drutil'.
-            // 'drutil eject' ejects the media.
-            // If we have multiple drives, we need to know which one.
-            // drutil list shows drives.
-            // Maybe we can use 'diskutil eject <device_path>'?
-            if let Some(path) = &drive.device_path {
-                let status = Command::new("diskutil")
-                    .arg("eject")
-                    .arg(path)
-                    .kill_on_drop(true)
-                    .status()
-                    .await;
-
-                if let Ok(s) = status {
-                    if s.success() {
-                        return Ok(());
-                    }
+        // Drain output still buffered after exit, which includes the end-of-run summary. Bounded
+        // in case a helper process inherited stdout and keeps it open.
+        let drain = async {
+            while let Ok(Some(line)) = stdout_lines.next_line().await {
+                if let Some(msg) = parse_msg_line(&line) {
+                    report.observe(&msg);
+                    progress_callback(ProgressUpdate::Message(msg));
                 }
             }
-
-            // Fallback to drutil eject (might eject wrong drive if multiple)
-            // TODO: Better multi-drive eject support on macOS
-            let _ = Command::new("drutil")
-                .arg("eject")
-                .kill_on_drop(true)
-                .status()
-                .await;
-        }
-
-        #[cfg(target_os = "linux")]
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+            .await
+            .is_err()
         {
-            if let Some(path) = &drive.device_path {
-                let _ = Command::new("eject")
-                    .arg(path)
-                    .kill_on_drop(true)
-                    .status()
-                    .await;
-            }
+            warn!("Drive {}: Timed out reading makemkvcon output", drive_index);
         }
+        info!("Drive {}: makemkvcon exited with {}", drive_index, status);
+        report.exit_code = status.code();
 
-        Ok(())
+        Ok(report)
     }
 }
 
@@ -382,7 +417,7 @@ io_RBufSizeMB = "1024"
 pub enum ProgressUpdate {
     Progress(Progress),
     ProgressTitle(ProgressTitle),
-    Message(String),
+    Message(Message),
 }
 
 #[derive(Debug, Clone)]
@@ -466,6 +501,7 @@ fn parse_drv_line(line: &str) -> Option<Drive> {
         drive_name,
         disc_name,
         device_path,
+        identity: None,
         state: DriveState::from(state_code),
     })
 }
@@ -570,12 +606,110 @@ fn parse_prgc_prgt_line(line: &str) -> Option<ProgressTitle> {
     })
 }
 
-fn parse_msg_line(line: &str) -> Option<String> {
+fn parse_msg_line(line: &str) -> Option<Message> {
     // MSG:code,flags,count,message,format,param0,...
     let content = line.strip_prefix("MSG:")?;
-    let parts = parse_csv(content);
-    if parts.len() >= 4 {
-        return Some(parts[3].clone());
+    let mut parts = parse_csv(content);
+    if parts.len() < 4 {
+        return None;
     }
-    None
+    let params = parts.split_off(5.min(parts.len()));
+    Some(Message {
+        code: parts[0].parse().ok()?,
+        _flags: parts[1].parse().unwrap_or(0),
+        text: parts[3].clone(),
+        params,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Captured from makemkvcon v2.0.0 ripping a two-title DVD (paths shortened).
+    const CLEAN_RIP: &[&str] = &[
+        r#"MSG:5014,131072,2,"Saving 2 titles into directory file:///out","Saving %1 titles into directory %2","2","file:///out""#,
+        r#"MSG:5005,128,1,"2 titles saved","%1 titles saved","2""#,
+        r#"MSG:5036,260,1,"Copy complete. 2 titles saved.","Copy complete. %1 titles saved.","2""#,
+    ];
+    const PARTIAL_RIP: &[&str] = &[
+        r#"MSG:5014,131072,2,"Saving 2 titles into directory file:///out","Saving %1 titles into directory %2","2","file:///out""#,
+        r#"MSG:2019,0,2,"Error 'Posix error - Is a directory' occurred while creating '/out/A2_t01.mkv'","Error '%1' occurred while creating '%2'","Posix error - Is a directory","/out/A2_t01.mkv""#,
+        r#"MSG:5003,0,2,"Failed to save title 1 to file /out/A2_t01.mkv","Failed to save title %1 to file %2","1","/out/A2_t01.mkv""#,
+        r#"MSG:5004,128,2,"1 titles saved, 1 failed","%1 titles saved, %2 failed","1","1""#,
+        r#"MSG:5037,516,2,"Copy complete. 1 titles saved, 1 failed.","Copy complete. %1 titles saved, %2 failed.","1","1""#,
+    ];
+
+    fn report_from(lines: &[&str]) -> RipReport {
+        let mut report = RipReport::default();
+        for line in lines {
+            report.observe(&parse_msg_line(line).unwrap());
+        }
+        report
+    }
+
+    #[test]
+    fn parses_msg_line() {
+        let msg = parse_msg_line(PARTIAL_RIP[4]).unwrap();
+        assert_eq!(msg.code, MSG_COPY_COMPLETE_FAILED);
+        assert_eq!(msg.text, "Copy complete. 1 titles saved, 1 failed.");
+        assert_eq!(msg.params, vec!["1", "1"]);
+
+        let msg =
+            parse_msg_line(r#"MSG:5010,0,0,"Failed to open disc","Failed to open disc""#).unwrap();
+        assert_eq!(msg.code, 5010);
+        assert!(msg.params.is_empty());
+    }
+
+    #[test]
+    fn report_from_clean_rip() {
+        let report = report_from(CLEAN_RIP);
+        assert_eq!(report.titles_to_save, Some(2));
+        assert_eq!(report.titles_saved, Some(2));
+        assert_eq!(report.titles_failed, Some(0));
+        assert!(report.title_errors.is_empty());
+    }
+
+    #[test]
+    fn report_from_partial_rip() {
+        let report = report_from(PARTIAL_RIP);
+        assert_eq!(report.titles_to_save, Some(2));
+        assert_eq!(report.titles_saved, Some(1));
+        assert_eq!(report.titles_failed, Some(1));
+        assert_eq!(
+            report.title_errors,
+            vec!["Failed to save title 1 to file /out/A2_t01.mkv"]
+        );
+    }
+
+    #[test]
+    fn report_without_summary() {
+        let report = report_from(&CLEAN_RIP[..1]);
+        assert_eq!(report.titles_saved, None);
+        assert_eq!(report.titles_failed, None);
+    }
+
+    fn title(duration: Option<&str>) -> Title {
+        Title {
+            id: 0,
+            name: None,
+            chapter_count: None,
+            duration: duration.map(String::from),
+            disk_size: None,
+            disk_size_bytes: None,
+            output_filename: None,
+        }
+    }
+
+    #[test]
+    fn counts_titles_at_or_above_min_length() {
+        assert_eq!(title(Some("1:02:03")).duration_secs(), Some(3723));
+        let titles = [
+            title(Some("0:00:20")),
+            title(Some("0:02:00")),
+            title(Some("0:44:10")),
+            title(None),
+        ];
+        assert_eq!(count_titles_to_rip(&titles, 120), 3);
+    }
 }
